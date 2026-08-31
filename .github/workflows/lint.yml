@@ -1,0 +1,159 @@
+name: Reusable Lint
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the repository's Taskfile.yml and mise.toml.
+        required: false
+        default: "."
+        type: string
+      cache-id:
+        description: Cache namespace. Keep distinct per workflow purpose.
+        required: false
+        default: lint
+        type: string
+      cache-paths:
+        description: >-
+          Newline-separated absolute or home-relative paths to cache, such as
+          the mise tool store and the pre-commit cache. Override per repository
+          to include dependency-manager stores.
+        required: false
+        default: |
+          ~/.local/share/mise
+          ~/.cache/pre-commit
+        type: string
+      cache-key-files:
+        description: >-
+          Newline-separated file paths, relative to working-directory, whose
+          contents invalidate the cache.
+        required: false
+        default: |
+          mise.toml
+          .pre-commit-config.yaml
+        type: string
+      # Optional GitHub App identity for private-dependency git access. When
+      # supplied alongside git-auth-repo, the job mints an App token and scopes
+      # it to exactly that repository's HTTPS clones (e.g. ansible-galaxy
+      # installing a private collection). Omit them to keep the job
+      # credential-free.
+      github-app-id:
+        description: GitHub App ID used to mint a token for private-dependency clones.
+        required: false
+        type: string
+      github-app-owner:
+        description: Organization where the GitHub App is installed.
+        required: false
+        type: string
+      git-auth-repo:
+        description: >-
+          The private repository to authenticate HTTPS clones for, e.g.
+          "Novirmor/cvp-ansible-collection". Required with github-app-id.
+        required: false
+        type: string
+      github-app-repositories:
+        description: >-
+          Comma-separated repository names the App token may access. Required
+          with github-app-id; use names without the organization prefix.
+        required: false
+        type: string
+    secrets:
+      # The App private key. Required only when the GitHub App identity inputs
+      # above are supplied. The caller is responsible for providing it as a
+      # secret (e.g. from its own secrets store); this workflow never talks to
+      # Bitwarden or any other secrets manager.
+      github_app_private_key:
+        required: false
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      # Authenticate git for private-dependency clones when a GitHub App identity
+      # is supplied. `actions/checkout` above already populated the standard
+      # GITHUB_TOKEN for the linting repository; this overrides HTTPS clones to
+      # github.com so they use the org-wide App token instead. Callers that lint
+      # private collections should install the collection once so it is cached.
+      - if: inputs.github-app-id != ''
+        name: Mint GitHub App token for private dependencies
+        id: github-app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ inputs.github-app-id }}
+          owner: ${{ inputs.github-app-owner }}
+          repositories: ${{ inputs.github-app-repositories }}
+          permission-contents: read
+          private-key: ${{ secrets.github_app_private_key }}
+
+      - if: inputs.github-app-id != ''
+        name: Authenticate git for private dependencies
+        env:
+          APP_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          AUTH_REPO: ${{ inputs.git-auth-repo }}
+        run: |
+          set -euo pipefail
+          # GitHub App tokens are JWTs that cannot be embedded in a URL. Encode
+          # the token as git basic auth (x-access-token:<token>, the same scheme
+          # actions/checkout uses) and scope it to the single private dependency
+          # repo so public clones of pre-commit hooks remain anonymous.
+          # ansible-galaxy's collection install then authenticates.
+          basic="$(printf 'x-access-token:%s' "$APP_TOKEN" | base64 -w0)"
+          git config --global "http.https://github.com/${AUTH_REPO}.git/.extraheader" "AUTHORIZATION: basic ${basic}"
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+        with:
+          working_directory: ${{ inputs.working-directory }}
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2
+
+      - name: Compute dependency cache key
+        id: cache-key
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          CACHE_KEY_FILES: ${{ inputs.cache-key-files }}
+        run: |
+          set -euo pipefail
+          workdir="${WORKING_DIRECTORY:-.}"
+          hash=""
+          while IFS= read -r f; do
+            f="$(printf '%s' "$f" | xargs)"
+            [ -z "$f" ] && continue
+            if [ -f "$workdir/$f" ]; then
+              hash="$hash$(sha256sum "$workdir/$f" | cut -d' ' -f1)"
+            fi
+          done <<< "$CACHE_KEY_FILES"
+          if [ -n "$hash" ]; then
+            printf 'hash=%s\n' "$(printf '%s' "$hash" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            printf 'hash=none\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: cache
+        if: inputs.cache-paths != ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-
+
+      - name: Lint
+        working-directory: ${{ inputs.working-directory }}
+        run: task lint
+
+      - name: Save dependency cache
+        if: >-
+          inputs.cache-paths != ''
+          && github.event_name != 'pull_request'
+          && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}

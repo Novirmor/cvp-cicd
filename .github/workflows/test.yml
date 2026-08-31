@@ -1,0 +1,96 @@
+name: Reusable Test
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the repository's Taskfile.yml and mise.toml.
+        required: false
+        default: "."
+        type: string
+      cache-id:
+        description: Cache namespace. Keep distinct per workflow purpose.
+        required: false
+        default: test
+        type: string
+      cache-paths:
+        description: >-
+          Newline-separated absolute or home-relative paths to cache, such as
+          the mise tool store and the pre-commit cache. Override per repository
+          to include dependency-manager stores.
+        required: false
+        default: |
+          ~/.local/share/mise
+          ~/.cache/pre-commit
+        type: string
+      cache-key-files:
+        description: >-
+          Newline-separated file paths, relative to working-directory, whose
+          contents invalidate the cache.
+        required: false
+        default: |
+          mise.toml
+          .pre-commit-config.yaml
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+        with:
+          working_directory: ${{ inputs.working-directory }}
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2
+
+      - name: Compute dependency cache key
+        id: cache-key
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          CACHE_KEY_FILES: ${{ inputs.cache-key-files }}
+        run: |
+          set -euo pipefail
+          workdir="${WORKING_DIRECTORY:-.}"
+          hash=""
+          while IFS= read -r f; do
+            f="$(printf '%s' "$f" | xargs)"
+            [ -z "$f" ] && continue
+            if [ -f "$workdir/$f" ]; then
+              hash="$hash$(sha256sum "$workdir/$f" | cut -d' ' -f1)"
+            fi
+          done <<< "$CACHE_KEY_FILES"
+          if [ -n "$hash" ]; then
+            printf 'hash=%s\n' "$(printf '%s' "$hash" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            printf 'hash=none\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: cache
+        if: inputs.cache-paths != ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-
+
+      - name: Test
+        working-directory: ${{ inputs.working-directory }}
+        run: task test
+
+      - name: Save dependency cache
+        if: >-
+          inputs.cache-paths != ''
+          && github.event_name != 'pull_request'
+          && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}

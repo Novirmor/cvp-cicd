@@ -1,0 +1,6 @@
+[tools]
+task = "3.52.0"
+actionlint = "1.7.12"
+"pipx:pre-commit" = "4.1.0"
+"aqua:gitleaks/gitleaks" = "v8.30.1"
+"github:woodruffw/zizmor" = "1.29.0"

@@ -1,0 +1,226 @@
+name: Reusable Release
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: >-
+          Existing immutable tag to release, for example v1.2.3. The workflow
+          checks out this tag and refuses anything that is not a semantic
+          version.
+        required: true
+        type: string
+      working-directory:
+        description: Directory containing the repository's Taskfile.yml and mise.toml.
+        required: false
+        default: "."
+        type: string
+      release-name:
+        description: Release title. Defaults to the tag.
+        required: false
+        default: ""
+        type: string
+      prerelease:
+        description: Mark the release as a prerelease.
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: Create the release as a draft.
+        required: false
+        default: false
+        type: boolean
+      generate-notes:
+        description: Ask GitHub to generate release notes from merged pull requests.
+        required: false
+        default: true
+        type: boolean
+      source-artifact-name:
+        description: >-
+          Artifact built by the artifact workflow from the same tag. Its files
+          become the release assets.
+        required: false
+        default: ""
+        type: string
+      sha256-file:
+        description: >-
+          Checksum manifest name inside the source artifact. Verified before
+          publishing when present.
+        required: false
+        default: SHA256SUMS
+        type: string
+      assets-path:
+        description: >-
+          Alternative to source-artifact-name: path or glob of release assets
+          produced by task release, relative to working-directory.
+        required: false
+        default: ""
+        type: string
+      cache-id:
+        description: Cache namespace. Keep distinct per workflow purpose.
+        required: false
+        default: release
+        type: string
+      cache-paths:
+        description: >-
+          Newline-separated absolute or home-relative paths to cache, such as
+          the mise tool store and the pre-commit cache. Override per repository
+          to include dependency-manager stores.
+        required: false
+        default: |
+          ~/.local/share/mise
+          ~/.cache/pre-commit
+        type: string
+      cache-key-files:
+        description: >-
+          Newline-separated file paths, relative to working-directory, whose
+          contents invalidate the cache.
+        required: false
+        default: |
+          mise.toml
+          .pre-commit-config.yaml
+        type: string
+    outputs:
+      release-url:
+        description: URL of the published release.
+        value: ${{ jobs.release.outputs.url }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - name: Validate release tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG#refs/tags/}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release-tag must be a semantic version tag such as v1.2.3, got '$tag'" >&2
+            exit 1
+          fi
+          printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the checked-out commit is the tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          head="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          if [ "$head" != "$tag_commit" ]; then
+            echo "checked-out commit $head is not the tag commit $tag_commit" >&2
+            exit 1
+          fi
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+        with:
+          working_directory: ${{ inputs.working-directory }}
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2
+
+      - name: Compute dependency cache key
+        id: cache-key
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          CACHE_KEY_FILES: ${{ inputs.cache-key-files }}
+        run: |
+          set -euo pipefail
+          workdir="${WORKING_DIRECTORY:-.}"
+          hash=""
+          while IFS= read -r f; do
+            f="$(printf '%s' "$f" | xargs)"
+            [ -z "$f" ] && continue
+            if [ -f "$workdir/$f" ]; then
+              hash="$hash$(sha256sum "$workdir/$f" | cut -d' ' -f1)"
+            fi
+          done <<< "$CACHE_KEY_FILES"
+          if [ -n "$hash" ]; then
+            printf 'hash=%s\n' "$(printf '%s' "$hash" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            printf 'hash=none\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: cache
+        if: inputs.cache-paths != ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-
+
+      - name: Prepare release
+        working-directory: ${{ inputs.working-directory }}
+        run: task release
+
+      - name: Download release assets
+        if: inputs.source-artifact-name != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.source-artifact-name }}
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+
+      - name: Verify asset checksums
+        if: inputs.source-artifact-name != ''
+        env:
+          SHA256_FILE: ${{ inputs.sha256-file }}
+          ASSETS_DIR: ${{ runner.temp }}/release-assets
+        run: |
+          set -euo pipefail
+          cd "$ASSETS_DIR"
+          if [ -n "${SHA256_FILE:-}" ] && [ -f "$SHA256_FILE" ]; then
+            sha256sum -c "$SHA256_FILE" --ignore-missing
+          fi
+
+      - name: Publish release
+        id: publish
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_NAME: ${{ inputs.release-name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          DRAFT: ${{ inputs.draft }}
+          GENERATE_NOTES: ${{ inputs.generate-notes }}
+          SOURCE_ARTIFACT: ${{ inputs.source-artifact-name }}
+          ASSETS_DIR: ${{ runner.temp }}/release-assets
+          ASSETS_PATH: ${{ inputs.assets-path }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          assets=()
+          if [ -n "$SOURCE_ARTIFACT" ] && [ -d "$ASSETS_DIR" ]; then
+            while IFS= read -r -d '' f; do
+              assets+=("$f")
+            done < <(find "$ASSETS_DIR" -type f -print0 | sort -z)
+          elif [ -n "$ASSETS_PATH" ]; then
+            shopt -s nullglob
+            for f in "$WORKING_DIRECTORY"/$ASSETS_PATH; do
+              [ -f "$f" ] && assets+=("$f")
+            done
+          fi
+
+          flags=()
+          [ "$PRERELEASE" = "true" ] && flags+=(--prerelease)
+          [ "$DRAFT" = "true" ] && flags+=(--draft)
+          [ "$GENERATE_NOTES" = "true" ] && flags+=(--generate-notes)
+          if [ -n "$RELEASE_NAME" ]; then
+            flags+=(--title "$RELEASE_NAME")
+          fi
+
+          gh release create "$TAG" "${assets[@]}" "${flags[@]}"
+          url="$(gh release view "$TAG" --json url --jq .url)"
+          printf 'url=%s\n' "$url" >> "$GITHUB_OUTPUT"

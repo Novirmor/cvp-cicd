@@ -1,0 +1,22 @@
+---
+version: "3"
+
+tasks:
+  default:
+    cmds: [task: lint]
+
+  lint:
+    desc: Run every quality gate
+    cmds:
+      - pre-commit run --all-files
+
+  test:
+    desc: Validate every workflow in the catalog
+    cmds:
+      - actionlint .github/workflows/*.yml
+
+  security:
+    desc: Scan Git history and GitHub Actions security posture
+    cmds:
+      - gitleaks git --redact --no-banner .
+      - zizmor .github/workflows

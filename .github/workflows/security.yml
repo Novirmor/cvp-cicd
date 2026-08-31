@@ -1,0 +1,155 @@
+name: Reusable Security
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing the repository's Taskfile.yml and mise.toml.
+        required: false
+        default: "."
+        type: string
+      fetch-depth:
+        description: >-
+          Git history depth for the checkout. Secret scanning needs the full
+          history, so this defaults to 0.
+        required: false
+        default: 0
+        type: number
+      upload-sarif:
+        description: >-
+          Upload the SARIF file reported by task security to Code Scanning.
+          Requires the caller job to grant security-events: write, and the
+          repository to have Code Scanning available.
+        required: false
+        default: false
+        type: boolean
+      sarif-path:
+        description: >-
+          Path to the SARIF file produced by task security, relative to
+          working-directory. Uploaded only when upload-sarif is true.
+        required: false
+        default: ""
+        type: string
+      report-path:
+        description: >-
+          Path to a scan report to keep as an artifact, relative to
+          working-directory. Uploaded even when the scan fails.
+        required: false
+        default: ""
+        type: string
+      report-name:
+        description: >-
+          Artifact name for the scan report. Callers using a matrix must give
+          each matrix instance a unique name.
+        required: false
+        default: security-report
+        type: string
+      retention-days:
+        description: Retention days for the scan report artifact.
+        required: false
+        default: 14
+        type: number
+      cache-id:
+        description: Cache namespace. Keep distinct per workflow purpose.
+        required: false
+        default: security
+        type: string
+      cache-paths:
+        description: >-
+          Newline-separated absolute or home-relative paths to cache, such as
+          the mise tool store and the pre-commit cache. Override per repository
+          to include dependency-manager stores.
+        required: false
+        default: |
+          ~/.local/share/mise
+          ~/.cache/pre-commit
+        type: string
+      cache-key-files:
+        description: >-
+          Newline-separated file paths, relative to working-directory, whose
+          contents invalidate the cache.
+        required: false
+        default: |
+          mise.toml
+          .pre-commit-config.yaml
+        type: string
+
+jobs:
+  security:
+    runs-on: ubuntu-24.04
+    # Callers that set upload-sarif: true must grant security-events: write on
+    # the calling job; this job's permissions cannot exceed the caller's.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+          persist-credentials: false
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4
+        with:
+          working_directory: ${{ inputs.working-directory }}
+
+      - uses: go-task/setup-task@a00fbb05ce67b35648be3c78cbc9fd85354c757e # v2
+
+      - name: Compute dependency cache key
+        id: cache-key
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          CACHE_KEY_FILES: ${{ inputs.cache-key-files }}
+        run: |
+          set -euo pipefail
+          workdir="${WORKING_DIRECTORY:-.}"
+          hash=""
+          while IFS= read -r f; do
+            f="$(printf '%s' "$f" | xargs)"
+            [ -z "$f" ] && continue
+            if [ -f "$workdir/$f" ]; then
+              hash="$hash$(sha256sum "$workdir/$f" | cut -d' ' -f1)"
+            fi
+          done <<< "$CACHE_KEY_FILES"
+          if [ -n "$hash" ]; then
+            printf 'hash=%s\n' "$(printf '%s' "$hash" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            printf 'hash=none\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: cache
+        if: inputs.cache-paths != ''
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-
+
+      - name: Security scan
+        working-directory: ${{ inputs.working-directory }}
+        run: task security
+
+      - name: Save dependency cache
+        if: >-
+          inputs.cache-paths != ''
+          && github.event_name != 'pull_request'
+          && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ inputs.cache-paths }}
+          key: ${{ runner.os }}-${{ inputs.cache-id }}-${{ inputs.working-directory }}-${{ steps.cache-key.outputs.hash }}
+
+      - name: Upload SARIF to Code Scanning
+        if: always() && inputs.upload-sarif && inputs.sarif-path != ''
+        uses: github/codeql-action/upload-sarif@c3400c2f38909e0dcf3c3a41f2030a8217be5d3e # v3
+        with:
+          sarif_file: ${{ inputs.working-directory }}/${{ inputs.sarif-path }}
+
+      - name: Upload scan report
+        if: always() && inputs.report-path != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.report-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.report-path }}
+          if-no-files-found: warn
+          retention-days: ${{ inputs.retention-days }}
