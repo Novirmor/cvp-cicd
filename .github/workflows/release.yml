@@ -199,6 +199,7 @@ jobs:
           ASSETS_DIR: ${{ runner.temp }}/release-assets
           ASSETS_PATH: ${{ inputs.assets-path }}
           WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           assets=()
